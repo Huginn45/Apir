@@ -1,0 +1,26 @@
+# Python / Desktop Build Artifacts
+apir_desktop/.venv/
+apir_desktop/build/
+apir_desktop/dist/
+apir_desktop/*.spec
+__pycache__/
+*.py[cod]
+*$py.class
+ApirDesktop.exe
+
+# Flutter / Mobile Build Artifacts
+apir_mobile/.dart_tool/
+apir_mobile/.packages
+apir_mobile/build/
+apir_mobile/.flutter-plugins
+apir_mobile/.flutter-plugins-dependencies
+apir_mobile/android/.gradle/
+apir_mobile/android/local.properties
+apir_mobile/ios/Pods/
+apir_mobile/ios/.symlinks/
+
+# OS / Editor Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
