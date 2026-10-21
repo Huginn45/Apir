@@ -6,7 +6,6 @@ apir_desktop/*.spec
 __pycache__/
 *.py[cod]
 *$py.class
-ApirDesktop.exe
 
 # Flutter / Mobile Build Artifacts
 apir_mobile/.dart_tool/
