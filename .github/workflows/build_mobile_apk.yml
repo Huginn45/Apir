@@ -28,6 +28,15 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
+      - name: Scaffold Android Gradle wrapper & platform resources
+        run: |
+          cp -r android/app/src/main/res/mipmap-* /tmp/
+          cp android/app/src/main/AndroidManifest.xml /tmp/AndroidManifest.xml
+          rm -rf android
+          flutter create . --platforms=android --org com.apir.remote --project-name apir_mobile
+          cp /tmp/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+          cp -r /tmp/mipmap-* android/app/src/main/res/
+
       - name: Run unit tests
         run: flutter test
 

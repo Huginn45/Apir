@@ -22,21 +22,23 @@ flutter:
   uses-material-design: true
 
   assets:
-    - assets/fonts/
     - assets/images/apir_logo.png
 
-  fonts:
-    - family: Tribo
-      fonts:
-        - asset: assets/fonts/Tribo-Regular.otf
-        - asset: assets/fonts/Tribo-Regular.ttf
-    - family: Garet
-      fonts:
-        - asset: assets/fonts/Garet-Book.otf
-          weight: 400
-        - asset: assets/fonts/Garet-Book.ttf
-          weight: 400
-        - asset: assets/fonts/Garet-Heavy.otf
-          weight: 700
-        - asset: assets/fonts/Garet-Heavy.ttf
-          weight: 700
+  # Uncomment the fonts section below once Tribo and Garet (.otf/.ttf) files
+  # are placed inside `apir_mobile/assets/fonts/`. Until then, `ThemeData` in
+  # `lib/main.dart` automatically uses the configured `Montserrat` / `Plus Jakarta Sans` fallback.
+  # fonts:
+  #   - family: Tribo
+  #     fonts:
+  #       - asset: assets/fonts/Tribo-Regular.otf
+  #       - asset: assets/fonts/Tribo-Regular.ttf
+  #   - family: Garet
+  #     fonts:
+  #       - asset: assets/fonts/Garet-Book.otf
+  #         weight: 400
+  #       - asset: assets/fonts/Garet-Book.ttf
+  #         weight: 400
+  #       - asset: assets/fonts/Garet-Heavy.otf
+  #         weight: 700
+  #       - asset: assets/fonts/Garet-Heavy.ttf
+  #         weight: 700

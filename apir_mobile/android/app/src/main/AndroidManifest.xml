@@ -1,5 +1,4 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.apir.remote">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!-- Camera permission for Apir QR Pairing Scanner -->
     <uses-permission android:name="android.permission.CAMERA" />
