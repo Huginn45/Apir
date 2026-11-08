@@ -103,6 +103,24 @@ BRAND_WARM_CREAM_25_ON_MAROON = "#80483B"
 BRAND_CRIMSON_RED = "#9E1F36"
 BRAND_ROYAL_BLUE = "#2B62A7"
 LOGO_PATH = get_resource_path("assets/apir_logo.png")
+SESSION_STATE_FILE = Path.home() / ".apir_session.json"
+_THREAD_LOCAL = threading.local()
+
+
+def enable_windows_dpi_awareness() -> None:
+    """
+    Enable Per-Monitor DPI awareness on Windows so `pynput` cursor coordinates
+    and `tkinter` Laser/Spotlight overlay positions match 1:1 on 125%/150%/200% displays.
+    """
+    if platform.system() != "Windows":
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
 
 def ensure_single_instance_or_focus(port: int) -> bool:
@@ -193,11 +211,34 @@ def list_all_lan_interfaces() -> List[Tuple[str, str]]:
     return found or [("Localhost", "127.0.0.1")]
 
 
-def generate_session_pin(fixed_pin: Optional[str] = None) -> str:
-    """Generate a 4-digit session PIN for the Apir QR Handshake."""
+def generate_session_pin(fixed_pin: Optional[str] = None, force_new: bool = False) -> str:
+    """
+    Generate or load a persistent 4-digit session PIN for the Apir QR Handshake.
+    Persisting the PIN in `~/.apir_session.json` allows the mobile app's
+    '1-Tap Instant Reconnect' to succeed even after restarting the desktop server,
+    while `force_new=True` (via the '↻ New PIN' button) rotates the PIN immediately.
+    """
     if fixed_pin and len(fixed_pin) == 4 and fixed_pin.isdigit():
         return fixed_pin
-    return f"{random.randint(0, 9999):04d}"
+
+    if not force_new and SESSION_STATE_FILE.exists():
+        try:
+            saved = json.loads(SESSION_STATE_FILE.read_text(encoding="utf-8"))
+            saved_pin = str(saved.get("token", "")).strip()
+            if len(saved_pin) == 4 and saved_pin.isdigit():
+                return saved_pin
+        except Exception:
+            pass
+
+    new_pin = f"{random.randint(0, 9999):04d}"
+    try:
+        SESSION_STATE_FILE.write_text(
+            json.dumps({"token": new_pin}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+    return new_pin
 
 
 def build_pairing_payload(ip: str, port: int, hostname: str, token: str) -> Dict[str, str]:
@@ -264,10 +305,13 @@ def capture_screen_thumbnail_base64(max_width: int = 480) -> Optional[str]:
     try:
         pil_shot: Optional[Image.Image] = None
         if MSS_AVAILABLE:
-            with mss.mss() as sct:
-                mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-                raw = sct.grab(mon)
-                pil_shot = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+            sct = getattr(_THREAD_LOCAL, "sct", None)
+            if sct is None:
+                sct = mss.mss()
+                _THREAD_LOCAL.sct = sct
+            mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+            raw = sct.grab(mon)
+            pil_shot = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
         else:
             pil_shot = ImageGrab.grab().convert("RGB")
 
@@ -280,9 +324,10 @@ def capture_screen_thumbnail_base64(max_width: int = 480) -> Optional[str]:
             pil_shot = pil_shot.resize((max_width, new_h), Image.Resampling.BILINEAR)
 
         buf = io.BytesIO()
-        pil_shot.save(buf, format="JPEG", quality=55, optimize=True)
+        pil_shot.save(buf, format="JPEG", quality=58, optimize=True)
         return base64.b64encode(buf.getvalue()).decode("ascii")
     except Exception as exc:
+        _THREAD_LOCAL.sct = None
         logger.debug("Screen preview capture skipped: %s", exc)
         return None
 
@@ -323,7 +368,9 @@ class ApirOverlayUI:
         self._icon_photo: Optional[ImageTk.PhotoImage] = None
         self._qr_label: Optional[tk.Label] = None
         self._host_label: Optional[tk.Label] = None
+        self._pin_label: Optional[tk.Label] = None
         self._iface_btn: Optional[tk.Button] = None
+        self.on_token_changed: Optional[ Any ] = None
 
         self._laser_active: bool = False
         self._spotlight_active: bool = False
@@ -414,6 +461,16 @@ class ApirOverlayUI:
         if len(self.interfaces) <= 1:
             return
         self.active_iface_idx = (self.active_iface_idx + 1) % len(self.interfaces)
+        self._refresh_qr_display()
+
+    def _rotate_pin(self) -> None:
+        self.token = generate_session_pin(force_new=True)
+        if callable(self.on_token_changed):
+            self.on_token_changed(self.token)
+        self._refresh_qr_display()
+        logger.info("Session PIN rotated to %s", self.token)
+
+    def _refresh_qr_display(self) -> None:
         pil_img = generate_qr_pil_image(self.qr_content, size=240)
         self._qr_photo = ImageTk.PhotoImage(pil_img)
         if self._qr_label is not None:
@@ -422,9 +479,11 @@ class ApirOverlayUI:
             self._host_label.configure(
                 text=f"{self.hostname}  •  {self.payload['uri']}"
             )
+        if self._pin_label is not None:
+            self._pin_label.configure(text=f"PIN: {self.token}")
         if self._iface_btn is not None:
             self._iface_btn.configure(
-                text=f"⇄ Network: {self.current_iface_name} ({self.current_ip})"
+                text=f"⇄ {self.current_iface_name} ({self.current_ip})"
             )
 
     def _create_qr_popup(self) -> None:
@@ -523,16 +582,16 @@ class ApirOverlayUI:
         )
         self._host_label.pack()
 
-        lbl_pin = tk.Label(
+        self._pin_label = tk.Label(
             meta_frame,
             text=f"PIN: {self.token}",
             font=("Garet", 13, "bold"),
             fg=BRAND_GOLDEN_AMBER,
             bg=BRAND_DEEP_MAROON,
         )
-        lbl_pin.pack(pady=(5, 4))
+        self._pin_label.pack(pady=(5, 4))
 
-        # Action Buttons Row: Switch Network IP & Hide to Tray
+        # Action Buttons Row: Switch Network IP, Rotate PIN & Hide to Tray
         btn_row = tk.Frame(meta_frame, bg=BRAND_DEEP_MAROON)
         btn_row.pack(pady=(2, 0))
 
@@ -546,11 +605,27 @@ class ApirOverlayUI:
             activebackground=BRAND_GOLDEN_AMBER,
             activeforeground=BRAND_DEEP_MAROON,
             relief=tk.FLAT,
-            padx=8,
+            padx=7,
             pady=3,
             cursor="hand2",
         )
-        self._iface_btn.pack(side=tk.LEFT, padx=4)
+        self._iface_btn.pack(side=tk.LEFT, padx=3)
+
+        new_pin_btn = tk.Button(
+            btn_row,
+            text="↻ New PIN",
+            command=self._rotate_pin,
+            font=("Garet", 8, "bold"),
+            fg=BRAND_WARM_CREAM,
+            bg=BRAND_ROYAL_BLUE,
+            activebackground=BRAND_GOLDEN_AMBER,
+            activeforeground=BRAND_DEEP_MAROON,
+            relief=tk.FLAT,
+            padx=7,
+            pady=3,
+            cursor="hand2",
+        )
+        new_pin_btn.pack(side=tk.LEFT, padx=3)
 
         hide_btn = tk.Button(
             btn_row,
@@ -562,11 +637,11 @@ class ApirOverlayUI:
             activebackground=BRAND_WARM_CREAM,
             activeforeground=BRAND_DEEP_MAROON,
             relief=tk.FLAT,
-            padx=8,
+            padx=7,
             pady=3,
             cursor="hand2",
         )
-        hide_btn.pack(side=tk.LEFT, padx=4)
+        hide_btn.pack(side=tk.LEFT, padx=3)
 
         win.update_idletasks()
         win.deiconify()
@@ -1176,6 +1251,7 @@ async def _async_websocket_daemon(
 
 
 def start_application(port: int, fixed_token: Optional[str], headless: bool) -> None:
+    enable_windows_dpi_awareness()
     if not ensure_single_instance_or_focus(port):
         # An existing Apir instance was already running and has been brought to focus!
         return
@@ -1223,6 +1299,7 @@ def start_application(port: int, fixed_token: Optional[str], headless: bool) -> 
         ui=ui,
         executor=executor,
     )
+    ui.on_token_changed = lambda new_tok: setattr(apir_server, "token", new_tok)
 
     if ui.headless:
         asyncio.run(_async_websocket_daemon(apir_server, local_ip, port, hostname, payload["uri"]))

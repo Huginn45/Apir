@@ -20,6 +20,11 @@ class ApirSocketService extends ChangeNotifier {
   PairingPayload? _lastSavedPayload;
   bool _isConnected = false;
   bool _isConnecting = false;
+  bool _isReconnecting = false;
+  bool _wasAuthenticatedThisSession = false;
+  bool _userInitiatedDisconnect = false;
+  int _reconnectAttempts = 0;
+  Timer? _reconnectTimer;
   String? _errorMessage;
   String _connectedHost = '';
   Uint8List? _latestPreviewBytes;
@@ -28,6 +33,8 @@ class ApirSocketService extends ChangeNotifier {
   PairingPayload? get lastSavedPayload => _lastSavedPayload;
   bool get isConnected => _isConnected;
   bool get isConnecting => _isConnecting;
+  bool get isReconnecting => _isReconnecting;
+  bool get hasActiveSession => _isConnected || _isReconnecting;
   String? get errorMessage => _errorMessage;
   String get connectedHost => _connectedHost;
   Uint8List? get latestPreviewBytes => _latestPreviewBytes;
@@ -65,8 +72,19 @@ class ApirSocketService extends ChangeNotifier {
   /// 2. Send `{"type": "handshake", "token": "<4_digit_pin>"}`
   /// 3. Wait for `handshake_ack` with status `ok`
   /// 4. Trigger `HapticFeedback.heavyImpact()` ("Apir!")
-  Future<bool> connectAndHandshake(PairingPayload payload) async {
-    await disconnect(notify: false);
+  Future<bool> connectAndHandshake(
+    PairingPayload payload, {
+    bool isAutoRetry = false,
+  }) async {
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    await _closeSocketOnly();
+
+    if (!isAutoRetry) {
+      _userInitiatedDisconnect = false;
+      _reconnectAttempts = 0;
+      _isReconnecting = false;
+    }
 
     _isConnecting = true;
     _errorMessage = null;
@@ -93,11 +111,18 @@ class ApirSocketService extends ChangeNotifier {
               if (data['status'] == 'ok') {
                 _isConnected = true;
                 _isConnecting = false;
+                _isReconnecting = false;
+                _wasAuthenticatedThisSession = true;
+                _reconnectAttempts = 0;
                 _connectedHost = (data['host'] ?? payload.host).toString();
                 _errorMessage = null;
 
                 // Trigger signature "Apir!" High-Five Heavy Haptic Impact
-                HapticFeedback.heavyImpact();
+                if (!isAutoRetry) {
+                  HapticFeedback.heavyImpact();
+                } else {
+                  HapticFeedback.selectionClick();
+                }
                 _saveHost(payload);
                 notifyListeners();
 
@@ -109,6 +134,8 @@ class ApirSocketService extends ChangeNotifier {
                     (data['message'] ?? 'Invalid session PIN token').toString();
                 _isConnected = false;
                 _isConnecting = false;
+                _isReconnecting = false;
+                _wasAuthenticatedThisSession = false;
                 notifyListeners();
 
                 if (!completer.isCompleted) {
@@ -128,18 +155,18 @@ class ApirSocketService extends ChangeNotifier {
           _errorMessage = 'Connection error: $error';
           _isConnected = false;
           _isConnecting = false;
-          notifyListeners();
           if (!completer.isCompleted) {
             completer.complete(false);
           }
+          _handleUnexpectedDisconnect();
         },
         onDone: () {
           _isConnected = false;
           _isConnecting = false;
-          notifyListeners();
           if (!completer.isCompleted) {
             completer.complete(false);
           }
+          _handleUnexpectedDisconnect();
         },
       );
 
@@ -155,8 +182,12 @@ class ApirSocketService extends ChangeNotifier {
           _errorMessage = 'Handshake timed out waiting for desktop response.';
           _isConnected = false;
           _isConnecting = false;
-          notifyListeners();
-          disconnect();
+          if (_wasAuthenticatedThisSession && !_userInitiatedDisconnect) {
+            _handleUnexpectedDisconnect();
+          } else {
+            notifyListeners();
+            disconnect();
+          }
           return false;
         },
       );
@@ -164,9 +195,52 @@ class ApirSocketService extends ChangeNotifier {
       _errorMessage = 'Could not reach ${payload.uri}';
       _isConnected = false;
       _isConnecting = false;
-      notifyListeners();
-      await disconnect(notify: false);
+      await _closeSocketOnly();
+      if (_wasAuthenticatedThisSession && !_userInitiatedDisconnect) {
+        _handleUnexpectedDisconnect();
+      } else {
+        notifyListeners();
+      }
       return false;
+    }
+  }
+
+  void _handleUnexpectedDisconnect() {
+    if (_userInitiatedDisconnect ||
+        !_wasAuthenticatedThisSession ||
+        _currentPayload == null) {
+      _isReconnecting = false;
+      notifyListeners();
+      return;
+    }
+
+    if (_reconnectAttempts >= 8) {
+      _isReconnecting = false;
+      _wasAuthenticatedThisSession = false;
+      notifyListeners();
+      return;
+    }
+
+    _isReconnecting = true;
+    _reconnectAttempts++;
+    final delayMs = (900 * (_reconnectAttempts <= 4 ? _reconnectAttempts : 4));
+    notifyListeners();
+
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(Duration(milliseconds: delayMs), () {
+      final target = _currentPayload;
+      if (target != null && !_userInitiatedDisconnect && !_isConnected) {
+        connectAndHandshake(target, isAutoRetry: true);
+      }
+    });
+  }
+
+  /// Trigger an immediate reconnect attempt (e.g. when the phone wakes from sleep).
+  Future<void> retryNowIfDisconnected() async {
+    final target = _currentPayload;
+    if (target != null && !_isConnected && !_isConnecting && !_userInitiatedDisconnect) {
+      _reconnectAttempts = 0;
+      await connectAndHandshake(target, isAutoRetry: true);
     }
   }
 
@@ -261,13 +335,23 @@ class ApirSocketService extends ChangeNotifier {
     _sendRaw({'type': 'dnd', 'active': active});
   }
 
-  Future<void> disconnect({bool notify = true}) async {
+  Future<void> _closeSocketOnly() async {
     await _subscription?.cancel();
     _subscription = null;
     try {
       await _channel?.sink.close();
     } catch (_) {}
     _channel = null;
+  }
+
+  Future<void> disconnect({bool notify = true}) async {
+    _userInitiatedDisconnect = true;
+    _wasAuthenticatedThisSession = false;
+    _isReconnecting = false;
+    _reconnectAttempts = 0;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    await _closeSocketOnly();
     _isConnected = false;
     _isConnecting = false;
     if (notify) {

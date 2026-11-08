@@ -26,7 +26,8 @@ class ControllerScreen extends StatefulWidget {
   State<ControllerScreen> createState() => _ControllerScreenState();
 }
 
-class _ControllerScreenState extends State<ControllerScreen> {
+class _ControllerScreenState extends State<ControllerScreen>
+    with WidgetsBindingObserver {
   // Sentinel prefix to reliably detect Backspace on soft keyboards
   static const String _sentinel = '\u200B';
 
@@ -66,6 +67,7 @@ class _ControllerScreenState extends State<ControllerScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _keyboardController = TextEditingController(text: _sentinel);
     HardwareKeyboard.instance.addHandler(_handleHardwareKey);
     _countdownTimer = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -83,7 +85,15 @@ class _ControllerScreenState extends State<ControllerScreen> {
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      widget.socketService.retryNowIfDisconnected();
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     HardwareKeyboard.instance.removeHandler(_handleHardwareKey);
     _countdownTimer?.cancel();
     _previewRefreshTimer?.cancel();
@@ -98,15 +108,26 @@ class _ControllerScreenState extends State<ControllerScreen> {
     super.dispose();
   }
 
+  void _triggerSlide(String dir) {
+    widget.socketService.sendSlide(dir);
+    if (_slidePreviewActive) {
+      Future<void>.delayed(const Duration(milliseconds: 180), () {
+        if (mounted && _slidePreviewActive) {
+          widget.socketService.requestPreview();
+        }
+      });
+    }
+  }
+
   bool _handleHardwareKey(KeyEvent event) {
     if (event is KeyDownEvent) {
       if (event.logicalKey == LogicalKeyboardKey.audioVolumeUp) {
         HapticFeedback.mediumImpact();
-        widget.socketService.sendSlide('next');
+        _triggerSlide('next');
         return true;
       } else if (event.logicalKey == LogicalKeyboardKey.audioVolumeDown) {
         HapticFeedback.mediumImpact();
-        widget.socketService.sendSlide('prev');
+        _triggerSlide('prev');
         return true;
       }
     }
@@ -324,6 +345,7 @@ class _ControllerScreenState extends State<ControllerScreen> {
 
       if (!_presenterLocked &&
           !_laserModeActive &&
+          !_spotlightModeActive &&
           elapsedMs < 260 &&
           _totalGestureDragDistance < 12.0) {
         if (_maxPointersInGesture == 1) {
@@ -352,6 +374,10 @@ class _ControllerScreenState extends State<ControllerScreen> {
     HapticFeedback.mediumImpact();
     setState(() {
       _laserModeActive = nextState;
+      if (_laserModeActive && _spotlightModeActive) {
+        _spotlightModeActive = false;
+        widget.socketService.sendSpotlight(active: false);
+      }
     });
     widget.socketService.sendLaser(active: _laserModeActive);
   }
@@ -459,7 +485,9 @@ class _ControllerScreenState extends State<ControllerScreen> {
                               ),
                               Flexible(
                                 child: Text(
-                                  'Connected to $hostName',
+                                  widget.socketService.isReconnecting
+                                      ? 'Reconnecting to $hostName...'
+                                      : 'Connected to $hostName',
                                   overflow: TextOverflow.ellipsis,
                                   style: const TextStyle(
                                     color: ApirBrand.warmCream,
@@ -569,7 +597,8 @@ class _ControllerScreenState extends State<ControllerScreen> {
                           border: Border.all(
                             color: _laserModeActive
                                 ? ApirBrand.crimsonRed
-                                : (_activeTouchPosition != null
+                                : ((_spotlightModeActive ||
+                                        _activeTouchPosition != null)
                                     ? ApirBrand.goldenAmber
                                     : ApirBrand.warmCream25),
                             width: 1.5,
@@ -629,13 +658,16 @@ class _ControllerScreenState extends State<ControllerScreen> {
                                       Text(
                                         _laserModeActive
                                             ? 'VIRTUAL LASER POINTER ACTIVE'
-                                            : (_presenterLocked
-                                                ? 'PRESENTER LOCK • CLICKS DISABLED'
-                                                : '1F MOVE/TAP • 2F RIGHT-CLICK/SCROLL'),
+                                            : (_spotlightModeActive
+                                                ? 'SPOTLIGHT BEAM ACTIVE'
+                                                : (_presenterLocked
+                                                    ? 'PRESENTER LOCK • CLICKS DISABLED'
+                                                    : '1F MOVE/TAP • 2F RIGHT-CLICK/SCROLL')),
                                         style: TextStyle(
                                           color: _laserModeActive
                                               ? ApirBrand.crimsonRed
-                                              : (_presenterLocked
+                                              : ((_spotlightModeActive ||
+                                                      _presenterLocked)
                                                   ? ApirBrand.goldenAmber
                                                   : ApirBrand.warmCream
                                                       .withOpacity(0.55)),
@@ -780,7 +812,7 @@ class _ControllerScreenState extends State<ControllerScreen> {
                                 isPrimary: false,
                                 onTap: () {
                                   HapticFeedback.mediumImpact();
-                                  widget.socketService.sendSlide('prev');
+                                  _triggerSlide('prev');
                                 },
                               ),
                             ),
@@ -793,7 +825,7 @@ class _ControllerScreenState extends State<ControllerScreen> {
                                 isPrimary: true,
                                 onTap: () {
                                   HapticFeedback.heavyImpact();
-                                  widget.socketService.sendSlide('next');
+                                  _triggerSlide('next');
                                 },
                               ),
                             ),
@@ -807,7 +839,7 @@ class _ControllerScreenState extends State<ControllerScreen> {
             ),
 
             // =================================================================
-            // 4. QUICK VERTICAL VOLUME SLIDER / POPOVER
+            // 4. QUICK VOLUME SLIDER & PRESENTATION SHORTCUTS POPOVER
             // =================================================================
             if (_volumePopoverVisible && !_presenterLocked)
               Positioned(
@@ -816,9 +848,9 @@ class _ControllerScreenState extends State<ControllerScreen> {
                 right: 0,
                 child: Center(
                   child: Container(
-                    width: 220,
+                    width: 280,
                     padding: const EdgeInsets.symmetric(
-                      horizontal: 18,
+                      horizontal: 16,
                       vertical: 14,
                     ),
                     decoration: BoxDecoration(
@@ -919,6 +951,36 @@ class _ControllerScreenState extends State<ControllerScreen> {
                               }
                             },
                           ),
+                        ),
+                        const SizedBox(height: 6),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                          children: [
+                            _buildPresentationActionChip(
+                              label: '▶ Start (F5)',
+                              onTap: () {
+                                HapticFeedback.mediumImpact();
+                                widget.socketService.sendPresentation('start');
+                                setState(() => _volumePopoverVisible = false);
+                              },
+                            ),
+                            _buildPresentationActionChip(
+                              label: '⬛ Blackout',
+                              onTap: () {
+                                HapticFeedback.selectionClick();
+                                widget.socketService
+                                    .sendPresentation('blackout');
+                              },
+                            ),
+                            _buildPresentationActionChip(
+                              label: '⏹ Exit (Esc)',
+                              onTap: () {
+                                HapticFeedback.mediumImpact();
+                                widget.socketService.sendPresentation('esc');
+                                setState(() => _volumePopoverVisible = false);
+                              },
+                            ),
+                          ],
                         ),
                       ],
                     ),
@@ -1030,6 +1092,34 @@ class _ControllerScreenState extends State<ControllerScreen> {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPresentationActionChip({
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+        decoration: BoxDecoration(
+          color: ApirBrand.warmCream25,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: ApirBrand.goldenAmber, width: 1.0),
+        ),
+        child: Text(
+          label,
+          style: const TextStyle(
+            color: ApirBrand.warmCream,
+            fontFamily: ApirBrand.bodyFontFamily,
+            fontFamilyFallback: ApirBrand.fontFallbacks,
+            fontSize: 11,
+            fontWeight: FontWeight.w700,
+          ),
         ),
       ),
     );

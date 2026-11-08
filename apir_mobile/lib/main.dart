@@ -194,7 +194,7 @@ class _ApirRemoteAppState extends State<ApirRemoteApp> {
         builder: (context, _) {
           return AnimatedSwitcher(
             duration: const Duration(milliseconds: 280),
-            child: _socketService.isConnected
+            child: _socketService.hasActiveSession
                 ? ControllerScreen(
                     key: const ValueKey('apir_controller_screen'),
                     socketService: _socketService,

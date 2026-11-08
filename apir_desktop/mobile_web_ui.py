@@ -517,8 +517,24 @@ MOBILE_WEB_HTML = r"""<!DOCTYPE html>
     }
   }
 
+  let reconnectTimer = null;
+  let reconnectAttempt = 0;
+  let pinRejected = false;
+
   function connectSocket() {
-    statusText.textContent = 'Connecting to ' + hostLabel + '...';
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    try {
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        ws.close();
+      }
+    } catch (_) {}
+
+    statusText.textContent = reconnectAttempt > 0
+      ? 'Reconnecting to ' + hostLabel + '...'
+      : 'Connecting to ' + hostLabel + '...';
     ws = new WebSocket(wsUri);
 
     ws.onopen = function() {
@@ -531,10 +547,13 @@ MOBILE_WEB_HTML = r"""<!DOCTYPE html>
         if (data.type === 'handshake_ack') {
           if (data.status === 'ok') {
             isConnected = true;
+            pinRejected = false;
+            reconnectAttempt = 0;
             statusDot.classList.remove('disconnected');
             statusText.textContent = 'Connected to ' + (data.host || hostLabel);
             haptic([40, 60, 90]);
           } else {
+            pinRejected = true;
             statusDot.classList.add('disconnected');
             statusText.textContent = 'PIN Error: ' + (data.message || 'Invalid token');
           }
@@ -548,13 +567,25 @@ MOBILE_WEB_HTML = r"""<!DOCTYPE html>
     ws.onclose = function() {
       isConnected = false;
       statusDot.classList.add('disconnected');
-      statusText.textContent = 'Disconnected • Tap 🔄';
+      if (pinRejected) return;
+      reconnectAttempt++;
+      const delayMs = Math.min(4000, 900 * Math.pow(1.4, reconnectAttempt - 1));
+      statusText.textContent = 'Reconnecting • Tap 🔄';
+      reconnectTimer = setTimeout(connectSocket, delayMs);
     };
   }
 
   connectSocket();
+  document.addEventListener('visibilitychange', function() {
+    if (document.visibilityState === 'visible' && !isConnected && !pinRejected) {
+      reconnectAttempt = 0;
+      connectSocket();
+    }
+  });
   document.getElementById('reconnectBtn').addEventListener('click', function() {
     haptic(20);
+    pinRejected = false;
+    reconnectAttempt = 0;
     connectSocket();
   });
 
