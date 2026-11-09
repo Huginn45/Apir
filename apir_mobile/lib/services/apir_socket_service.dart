@@ -258,13 +258,17 @@ class ApirSocketService extends ChangeNotifier {
     _sendRaw({'type': 'slide', 'dir': dir});
   }
 
+  int _movePacketCount = 0;
+
   /// Relative mouse cursor movement (`dx`, `dy`)
   void sendMove(double dx, double dy) {
     if (!_isConnected) return;
+    _movePacketCount++;
     _sendRaw({
       'type': 'move',
       'dx': double.parse(dx.toStringAsFixed(2)),
       'dy': double.parse(dy.toStringAsFixed(2)),
+      if (_movePacketCount % 3 == 0) 'k': 1,
     });
   }
 

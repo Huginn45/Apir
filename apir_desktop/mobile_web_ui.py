@@ -829,7 +829,7 @@ MOBILE_WEB_HTML = r"""<!DOCTYPE html>
     sendCmd({ type: 'dnd', active: dndActive });
   });
 
-  // Interactive Dot-Matrix Trackpad Canvas (120fps rAF + Batched Path + Coalesced WS)
+  // Interactive Dot-Matrix Trackpad Canvas (Offscreen Cached Grid + O(1) Local Neighborhood Glow)
   let touchPos = null;
   let lastTouchX = 0;
   let lastTouchY = 0;
@@ -841,30 +841,71 @@ MOBILE_WEB_HTML = r"""<!DOCTYPE html>
   let pendingDx = 0;
   let pendingDy = 0;
   let pendingScrollDy = 0;
+  let frameTickCount = 0;
+
+  const spacing = 24;
+  const baseRadius = 1.75;
+  const influence = 115;
+  const influenceSq = influence * influence;
+  let gridCols = 0;
+  let gridRows = 0;
+  let gridStartX = 0;
+  let gridStartY = 0;
+
+  // Offscreen canvas holding the pre-rendered static Warm Cream dot matrix
+  const bgCanvas = document.createElement('canvas');
+  const bgCtx = bgCanvas.getContext('2d');
 
   function resizeCanvas() {
     canvasRect = canvas.getBoundingClientRect();
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = canvasRect.width * dpr;
-    canvas.height = canvasRect.height * dpr;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = Math.max(1, canvasRect.width);
+    const h = Math.max(1, canvasRect.height);
+
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    bgCanvas.width = w * dpr;
+    bgCanvas.height = h * dpr;
+    bgCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    bgCtx.clearRect(0, 0, w, h);
+
+    gridCols = Math.floor(w / spacing);
+    gridRows = Math.floor(h / spacing);
+    gridStartX = (w - (gridCols - 1) * spacing) / 2;
+    gridStartY = (h - (gridRows - 1) * spacing) / 2;
+
+    bgCtx.fillStyle = 'rgba(253, 236, 200, 0.25)';
+    bgCtx.beginPath();
+    for (let r = 0; r < gridRows; r++) {
+      const y = gridStartY + r * spacing;
+      for (let c = 0; c < gridCols; c++) {
+        const x = gridStartX + c * spacing;
+        bgCtx.moveTo(x + baseRadius, y);
+        bgCtx.arc(x, y, baseRadius, 0, Math.PI * 2);
+      }
+    }
+    bgCtx.fill();
     drawDots();
   }
   window.addEventListener('resize', resizeCanvas);
 
   function flushNetworkAndRender() {
     rafPending = false;
+    frameTickCount++;
     if (pendingDx !== 0 || pendingDy !== 0) {
       const dx = Math.round(pendingDx * 100) / 100;
       const dy = Math.round(pendingDy * 100) / 100;
       pendingDx = 0;
       pendingDy = 0;
+      const keepalive = (frameTickCount % 3 === 0) ? 1 : 0;
       if (laserActive) {
-        sendCmd({ type: 'laser', active: true, dx: dx, dy: dy });
+        sendCmd({ type: 'laser', active: true, dx: dx, dy: dy, k: keepalive });
       } else if (spotlightActive) {
-        sendCmd({ type: 'spotlight', active: true, dx: dx, dy: dy });
+        sendCmd({ type: 'spotlight', active: true, dx: dx, dy: dy, k: keepalive });
       } else {
-        sendCmd({ type: 'move', dx: dx, dy: dy });
+        sendCmd({ type: 'move', dx: dx, dy: dy, k: keepalive });
       }
     }
     if (pendingScrollDy !== 0) {
@@ -887,64 +928,52 @@ MOBILE_WEB_HTML = r"""<!DOCTYPE html>
     const h = canvasRect.height || canvas.clientHeight;
     ctx.clearRect(0, 0, w, h);
 
-    const spacing = 24;
-    const baseRadius = 1.75;
-    const influence = 115;
-    const influenceSq = influence * influence;
-    const cols = Math.floor(w / spacing);
-    const rows = Math.floor(h / spacing);
-    const startX = (w - (cols - 1) * spacing) / 2;
-    const startY = (h - (rows - 1) * spacing) / 2;
-
-    if (touchPos) {
-      const grad = ctx.createRadialGradient(
-        touchPos.x, touchPos.y, 2,
-        touchPos.x, touchPos.y, influence
-      );
-      grad.addColorStop(0, laserActive ? 'rgba(158, 31, 54, 0.38)' : 'rgba(245, 158, 29, 0.28)');
-      grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
-      ctx.fillStyle = grad;
-      ctx.beginPath();
-      ctx.arc(touchPos.x, touchPos.y, influence, 0, Math.PI * 2);
-      ctx.fill();
+    // 1. Hardware-accelerated blit of pre-rendered static dot grid (O(1))
+    if (bgCanvas.width > 0 && bgCanvas.height > 0) {
+      ctx.drawImage(bgCanvas, 0, 0, w, h);
     }
 
-    // Batch all inactive dots into a single GPU path call for 120fps rendering
-    ctx.fillStyle = 'rgba(253, 236, 200, 0.25)';
+    if (!touchPos) return;
+
+    // 2. Ambient radial halo around touch point
+    const grad = ctx.createRadialGradient(
+      touchPos.x, touchPos.y, 2,
+      touchPos.x, touchPos.y, influence
+    );
+    grad.addColorStop(0, laserActive ? 'rgba(158, 31, 54, 0.38)' : 'rgba(245, 158, 29, 0.28)');
+    grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    ctx.fillStyle = grad;
     ctx.beginPath();
-    const activeDots = [];
-
-    for (let r = 0; r < rows; r++) {
-      const y = startY + r * spacing;
-      for (let c = 0; c < cols; c++) {
-        const x = startX + c * spacing;
-        if (touchPos) {
-          const dx = x - touchPos.x;
-          const dy = y - touchPos.y;
-          const distSq = dx * dx + dy * dy;
-          if (distSq < influenceSq) {
-            activeDots.push({ x: x, y: y, dist: Math.sqrt(distSq) });
-            continue;
-          }
-        }
-        ctx.moveTo(x + baseRadius, y);
-        ctx.arc(x, y, baseRadius, 0, Math.PI * 2);
-      }
-    }
+    ctx.arc(touchPos.x, touchPos.y, influence, 0, Math.PI * 2);
     ctx.fill();
 
-    // Draw only the active glowing dots near the finger
-    for (let i = 0; i < activeDots.length; i++) {
-      const d = activeDots[i];
-      const t = 1 - d.dist / influence;
-      const eased = t * t * (3 - 2 * t);
-      const radius = baseRadius + 3.4 * eased;
-      ctx.fillStyle = laserActive
-        ? `rgba(158, 31, 54, ${0.35 + 0.65 * eased})`
-        : `rgba(245, 158, 29, ${0.35 + 0.65 * eased})`;
-      ctx.beginPath();
-      ctx.arc(d.x, d.y, radius, 0, Math.PI * 2);
-      ctx.fill();
+    // 3. Only iterate over the small bounding box of dots within `influence` radius (~25 dots instead of 200!)
+    const minCol = Math.max(0, Math.floor((touchPos.x - influence - gridStartX) / spacing));
+    const maxCol = Math.min(gridCols - 1, Math.ceil((touchPos.x + influence - gridStartX) / spacing));
+    const minRow = Math.max(0, Math.floor((touchPos.y - influence - gridStartY) / spacing));
+    const maxRow = Math.min(gridRows - 1, Math.ceil((touchPos.y + influence - gridStartY) / spacing));
+
+    for (let r = minRow; r <= maxRow; r++) {
+      const y = gridStartY + r * spacing;
+      const dy = y - touchPos.y;
+      const dySq = dy * dy;
+      for (let c = minCol; c <= maxCol; c++) {
+        const x = gridStartX + c * spacing;
+        const dx = x - touchPos.x;
+        const distSq = dx * dx + dySq;
+        if (distSq < influenceSq) {
+          const dist = Math.sqrt(distSq);
+          const t = 1 - dist / influence;
+          const eased = t * t * (3 - 2 * t);
+          const radius = baseRadius + 3.4 * eased;
+          ctx.fillStyle = laserActive
+            ? `rgba(158, 31, 54, ${0.35 + 0.65 * eased})`
+            : `rgba(245, 158, 29, ${0.35 + 0.65 * eased})`;
+          ctx.beginPath();
+          ctx.arc(x, y, radius, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
     }
   }
 

@@ -884,7 +884,9 @@ class _WinPoint(ctypes.Structure):
 class OSInputExecutor:
     """
     Executes ultra-low-latency mouse, keyboard, media, laser, spotlight, and DND operations.
-    Preserves sub-pixel movement remainders so micro-movements never stutter or drop.
+    Uses a dedicated 240Hz (4ms) desktop cursor & overlay interpolation thread so that even
+    if mobile Wi-Fi delivers packets in 30-60Hz bursts, the laptop cursor and laser glide at
+    native monitor refresh rate (120Hz-240Hz) with zero stutter.
     """
 
     def __init__(self, ui: ApirOverlayUI) -> None:
@@ -897,8 +899,46 @@ class OSInputExecutor:
         self._fallback_pos = [960, 540]
         self._rem_x: float = 0.0
         self._rem_y: float = 0.0
+        self._pending_dx: float = 0.0
+        self._pending_dy: float = 0.0
+        self._lock = threading.Lock()
         self._win_pt = _WinPoint()
         self._is_windows = platform.system() == "Windows"
+        self._smoother_thread = threading.Thread(
+            target=self._cursor_smoothing_loop,
+            name="ApirCursorSmoother240Hz",
+            daemon=True,
+        )
+        self._smoother_thread.start()
+
+    def _cursor_smoothing_loop(self) -> None:
+        import time
+        while True:
+            with self._lock:
+                pdx = self._pending_dx
+                pdy = self._pending_dy
+                if abs(pdx) > 0.01 or abs(pdy) > 0.01:
+                    # Drain 45% of remaining delta every 4ms (~240Hz exponential glide)
+                    step_x = pdx * 0.45 if abs(pdx) > 0.35 else pdx
+                    step_y = pdy * 0.45 if abs(pdy) > 0.35 else pdy
+                    self._pending_dx -= step_x
+                    self._pending_dy -= step_y
+                else:
+                    step_x = 0.0
+                    step_y = 0.0
+                    self._pending_dx = 0.0
+                    self._pending_dy = 0.0
+
+            if step_x != 0.0 or step_y != 0.0:
+                self._move_cursor_subpixel(step_x, step_y)
+                if self.laser_active:
+                    cx, cy = self._get_cursor_pos()
+                    self.ui.set_laser(True, cx, cy)
+                elif self.spotlight_active:
+                    cx, cy = self._get_cursor_pos()
+                    self.ui.set_spotlight(True, cx, cy)
+
+            time.sleep(0.004)
 
     def _get_cursor_pos(self) -> tuple[int, int]:
         if self._is_windows:
@@ -963,13 +1003,9 @@ class OSInputExecutor:
             logger.info("Presentation -> EXIT (Esc)")
 
     def handle_move(self, dx: float, dy: float) -> None:
-        self._move_cursor_subpixel(dx, dy)
-        if self.laser_active:
-            cx, cy = self._get_cursor_pos()
-            self.ui.set_laser(True, cx, cy)
-        if self.spotlight_active:
-            cx, cy = self._get_cursor_pos()
-            self.ui.set_spotlight(True, cx, cy)
+        with self._lock:
+            self._pending_dx += dx
+            self._pending_dy += dy
 
     def handle_click(self, button_name: str) -> None:
         btn = Button.right if button_name == "right" else Button.left
@@ -1026,22 +1062,32 @@ class OSInputExecutor:
             logger.info("Remote Text -> %r", value)
 
     def handle_laser(self, active: bool, dx: float = 0.0, dy: float = 0.0) -> None:
+        prev_active = self.laser_active
         self.laser_active = active
         if active and self.spotlight_active:
             self.spotlight_active = False
             self.ui.set_spotlight(False, 0, 0)
-        self._move_cursor_subpixel(dx, dy)
-        cx, cy = self._get_cursor_pos()
-        self.ui.set_laser(active, cx, cy)
+        if dx != 0.0 or dy != 0.0:
+            with self._lock:
+                self._pending_dx += dx
+                self._pending_dy += dy
+        if active != prev_active or (dx == 0.0 and dy == 0.0):
+            cx, cy = self._get_cursor_pos()
+            self.ui.set_laser(active, cx, cy)
 
     def handle_spotlight(self, active: bool, dx: float = 0.0, dy: float = 0.0) -> None:
+        prev_active = self.spotlight_active
         self.spotlight_active = active
         if active and self.laser_active:
             self.laser_active = False
             self.ui.set_laser(False, 0, 0)
-        self._move_cursor_subpixel(dx, dy)
-        cx, cy = self._get_cursor_pos()
-        self.ui.set_spotlight(active, cx, cy)
+        if dx != 0.0 or dy != 0.0:
+            with self._lock:
+                self._pending_dx += dx
+                self._pending_dy += dy
+        if active != prev_active or (dx == 0.0 and dy == 0.0):
+            cx, cy = self._get_cursor_pos()
+            self.ui.set_spotlight(active, cx, cy)
 
     def handle_dnd(self, active: bool) -> bool:
         self.dnd_active = active
@@ -1210,6 +1256,9 @@ class ApirServer:
                         "command": msg_type,
                         "status": "ok",
                     }))
+                elif data.get("k"):
+                    # Ultra-lightweight 2-byte keepalive echo to prevent mobile Wi-Fi 802.11 PSM sleep
+                    await websocket.send('{"t":"k"}')
 
         except websockets.exceptions.ConnectionClosed:
             logger.info("Client %s disconnected", peer)
