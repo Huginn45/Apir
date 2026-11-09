@@ -829,31 +829,68 @@ MOBILE_WEB_HTML = r"""<!DOCTYPE html>
     sendCmd({ type: 'dnd', active: dndActive });
   });
 
-  // Interactive Dot-Matrix Trackpad Canvas
+  // Interactive Dot-Matrix Trackpad Canvas (120fps rAF + Batched Path + Coalesced WS)
   let touchPos = null;
   let lastTouchX = 0;
   let lastTouchY = 0;
   let touchStartTime = 0;
   let totalDrag = 0;
   let maxTouches = 0;
+  let canvasRect = { left: 0, top: 0, width: 300, height: 300 };
+  let rafPending = false;
+  let pendingDx = 0;
+  let pendingDy = 0;
+  let pendingScrollDy = 0;
 
   function resizeCanvas() {
-    const rect = canvas.getBoundingClientRect();
-    canvas.width = rect.width * window.devicePixelRatio;
-    canvas.height = rect.height * window.devicePixelRatio;
-    ctx.setTransform(window.devicePixelRatio, 0, 0, window.devicePixelRatio, 0, 0);
+    canvasRect = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = canvasRect.width * dpr;
+    canvas.height = canvasRect.height * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     drawDots();
   }
   window.addEventListener('resize', resizeCanvas);
 
+  function flushNetworkAndRender() {
+    rafPending = false;
+    if (pendingDx !== 0 || pendingDy !== 0) {
+      const dx = Math.round(pendingDx * 100) / 100;
+      const dy = Math.round(pendingDy * 100) / 100;
+      pendingDx = 0;
+      pendingDy = 0;
+      if (laserActive) {
+        sendCmd({ type: 'laser', active: true, dx: dx, dy: dy });
+      } else if (spotlightActive) {
+        sendCmd({ type: 'spotlight', active: true, dx: dx, dy: dy });
+      } else {
+        sendCmd({ type: 'move', dx: dx, dy: dy });
+      }
+    }
+    if (pendingScrollDy !== 0) {
+      const sdy = Math.round(pendingScrollDy * 100) / 100;
+      pendingScrollDy = 0;
+      sendCmd({ type: 'scroll', dy: sdy });
+    }
+    drawDots();
+  }
+
+  function scheduleFrame() {
+    if (!rafPending) {
+      rafPending = true;
+      requestAnimationFrame(flushNetworkAndRender);
+    }
+  }
+
   function drawDots() {
-    const w = canvas.clientWidth;
-    const h = canvas.clientHeight;
+    const w = canvasRect.width || canvas.clientWidth;
+    const h = canvasRect.height || canvas.clientHeight;
     ctx.clearRect(0, 0, w, h);
 
     const spacing = 24;
     const baseRadius = 1.75;
     const influence = 115;
+    const influenceSq = influence * influence;
     const cols = Math.floor(w / spacing);
     const rows = Math.floor(h / spacing);
     const startX = (w - (cols - 1) * spacing) / 2;
@@ -872,41 +909,51 @@ MOBILE_WEB_HTML = r"""<!DOCTYPE html>
       ctx.fill();
     }
 
+    // Batch all inactive dots into a single GPU path call for 120fps rendering
+    ctx.fillStyle = 'rgba(253, 236, 200, 0.25)';
+    ctx.beginPath();
+    const activeDots = [];
+
     for (let r = 0; r < rows; r++) {
       const y = startY + r * spacing;
       for (let c = 0; c < cols; c++) {
         const x = startX + c * spacing;
-        let radius = baseRadius;
-        let fill = 'rgba(253, 236, 200, 0.25)';
-
         if (touchPos) {
           const dx = x - touchPos.x;
           const dy = y - touchPos.y;
-          const dist = Math.sqrt(dx * dx + dy * dy);
-          if (dist < influence) {
-            const t = 1 - dist / influence;
-            const eased = t * t * (3 - 2 * t);
-            radius = baseRadius + 3.4 * eased;
-            fill = laserActive
-              ? `rgba(158, 31, 54, ${0.35 + 0.65 * eased})`
-              : `rgba(245, 158, 29, ${0.35 + 0.65 * eased})`;
+          const distSq = dx * dx + dy * dy;
+          if (distSq < influenceSq) {
+            activeDots.push({ x: x, y: y, dist: Math.sqrt(distSq) });
+            continue;
           }
         }
-
-        ctx.fillStyle = fill;
-        ctx.beginPath();
-        ctx.arc(x, y, radius, 0, Math.PI * 2);
-        ctx.fill();
+        ctx.moveTo(x + baseRadius, y);
+        ctx.arc(x, y, baseRadius, 0, Math.PI * 2);
       }
+    }
+    ctx.fill();
+
+    // Draw only the active glowing dots near the finger
+    for (let i = 0; i < activeDots.length; i++) {
+      const d = activeDots[i];
+      const t = 1 - d.dist / influence;
+      const eased = t * t * (3 - 2 * t);
+      const radius = baseRadius + 3.4 * eased;
+      ctx.fillStyle = laserActive
+        ? `rgba(158, 31, 54, ${0.35 + 0.65 * eased})`
+        : `rgba(245, 158, 29, ${0.35 + 0.65 * eased})`;
+      ctx.beginPath();
+      ctx.arc(d.x, d.y, radius, 0, Math.PI * 2);
+      ctx.fill();
     }
   }
 
   canvas.addEventListener('touchstart', function(e) {
     e.preventDefault();
-    const rect = canvas.getBoundingClientRect();
+    canvasRect = canvas.getBoundingClientRect();
     const t = e.touches[0];
-    lastTouchX = t.clientX - rect.left;
-    lastTouchY = t.clientY - rect.top;
+    lastTouchX = t.clientX - canvasRect.left;
+    lastTouchY = t.clientY - canvasRect.top;
     touchPos = { x: lastTouchX, y: lastTouchY };
 
     if (e.touches.length === 1) {
@@ -917,36 +964,36 @@ MOBILE_WEB_HTML = r"""<!DOCTYPE html>
       maxTouches = e.touches.length;
     }
     trackpadWrap.classList.add('touch-active');
-    drawDots();
+    scheduleFrame();
   }, { passive: false });
 
   canvas.addEventListener('touchmove', function(e) {
     e.preventDefault();
-    const rect = canvas.getBoundingClientRect();
     const t = e.touches[0];
-    const curX = t.clientX - rect.left;
-    const curY = t.clientY - rect.top;
-    const dx = (curX - lastTouchX) * 1.75;
-    const dy = (curY - lastTouchY) * 1.75;
-    totalDrag += Math.hypot(curX - lastTouchX, curY - lastTouchY);
+    const curX = t.clientX - canvasRect.left;
+    const curY = t.clientY - canvasRect.top;
+    const rawDx = curX - lastTouchX;
+    const rawDy = curY - lastTouchY;
+    const stepDist = Math.hypot(rawDx, rawDy);
+    totalDrag += stepDist;
     lastTouchX = curX;
     lastTouchY = curY;
     touchPos = { x: curX, y: curY };
 
+    // Smooth velocity-based pointer acceleration curve
+    const accel = Math.min(2.8, 1.45 + stepDist * 0.045);
+    const dx = rawDx * accel;
+    const dy = rawDy * accel;
+
     if (e.touches.length === 1) {
-      if (laserActive) {
-        sendCmd({ type: 'laser', active: true, dx: dx, dy: dy });
-      } else if (spotlightActive) {
-        sendCmd({ type: 'spotlight', active: true, dx: dx, dy: dy });
-      } else {
-        sendCmd({ type: 'move', dx: dx, dy: dy });
-      }
+      pendingDx += dx;
+      pendingDy += dy;
     } else if (e.touches.length >= 2 && !presenterLocked) {
-      if (Math.abs(dy) > 0.5) {
-        sendCmd({ type: 'scroll', dy: -dy * 0.15 });
+      if (Math.abs(rawDy) > 0.3) {
+        pendingScrollDy += -rawDy * 0.22;
       }
     }
-    drawDots();
+    scheduleFrame();
   }, { passive: false });
 
   canvas.addEventListener('touchend', function(e) {
@@ -964,7 +1011,7 @@ MOBILE_WEB_HTML = r"""<!DOCTYPE html>
       }
       touchPos = null;
       trackpadWrap.classList.remove('touch-active');
-      drawDots();
+      scheduleFrame();
     }
   }, { passive: false });
 

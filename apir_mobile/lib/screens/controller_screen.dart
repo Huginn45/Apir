@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 
 import '../main.dart';
@@ -54,14 +56,18 @@ class _ControllerScreenState extends State<ControllerScreen>
   Timer? _countdownTimer;
   Timer? _previewRefreshTimer;
 
-  // Multi-touch trackpad gesture state
-  Offset? _activeTouchPosition;
+  // Multi-touch trackpad gesture state (ValueNotifier avoids full widget-tree rebuilds at 120Hz)
+  final ValueNotifier<Offset?> _touchPointNotifier =
+      ValueNotifier<Offset?>(null);
   final Map<int, Offset> _activePointers = <int, Offset>{};
   int _maxPointersInGesture = 0;
   DateTime? _gestureStartTime;
   double _totalGestureDragDistance = 0.0;
+  double _pendingDx = 0.0;
+  double _pendingDy = 0.0;
+  double _pendingScrollDy = 0.0;
+  bool _frameFlushScheduled = false;
 
-  static const double _cursorSensitivity = 1.65;
   static const double _scrollSensitivity = 0.22;
 
   @override
@@ -103,6 +109,7 @@ class _ControllerScreenState extends State<ControllerScreen>
     if (_spotlightModeActive) {
       widget.socketService.sendSpotlight(active: false);
     }
+    _touchPointNotifier.dispose();
     _keyboardFocusNode.dispose();
     _keyboardController.dispose();
     super.dispose();
@@ -289,8 +296,35 @@ class _ControllerScreenState extends State<ControllerScreen>
   }
 
   // ---------------------------------------------------------------------------
-  // Multi-Touch Dot-Matrix Trackpad & Laser Gestures
+  // Multi-Touch Dot-Matrix Trackpad & Laser Gestures (120Hz Coalesced Pipeline)
   // ---------------------------------------------------------------------------
+  void _scheduleNetworkFlush() {
+    if (_frameFlushScheduled) return;
+    _frameFlushScheduled = true;
+    SchedulerBinding.instance.scheduleFrameCallback((_) {
+      _frameFlushScheduled = false;
+      if (!mounted) return;
+      if (_pendingDx != 0.0 || _pendingDy != 0.0) {
+        final dx = _pendingDx;
+        final dy = _pendingDy;
+        _pendingDx = 0.0;
+        _pendingDy = 0.0;
+        if (_laserModeActive) {
+          widget.socketService.sendLaser(active: true, dx: dx, dy: dy);
+        } else if (_spotlightModeActive) {
+          widget.socketService.sendSpotlight(active: true, dx: dx, dy: dy);
+        } else {
+          widget.socketService.sendMove(dx, dy);
+        }
+      }
+      if (_pendingScrollDy != 0.0) {
+        final sdy = _pendingScrollDy;
+        _pendingScrollDy = 0.0;
+        widget.socketService.sendScroll(sdy);
+      }
+    });
+  }
+
   void _onPointerDown(PointerDownEvent event) {
     _activePointers[event.pointer] = event.localPosition;
     if (_activePointers.length == 1) {
@@ -301,36 +335,32 @@ class _ControllerScreenState extends State<ControllerScreen>
       _maxPointersInGesture = _activePointers.length;
     }
 
-    setState(() {
-      _activeTouchPosition = event.localPosition;
-      if (_volumePopoverVisible) {
+    _touchPointNotifier.value = event.localPosition;
+    if (_volumePopoverVisible) {
+      setState(() {
         _volumePopoverVisible = false;
-      }
-    });
+      });
+    }
   }
 
   void _onPointerMove(PointerMoveEvent event) {
     _activePointers[event.pointer] = event.localPosition;
-    _totalGestureDragDistance += event.delta.distance;
+    final stepDist = event.delta.distance;
+    _totalGestureDragDistance += stepDist;
 
-    setState(() {
-      _activeTouchPosition = event.localPosition;
-    });
+    // Repaint only the CustomPainter canvas via ValueNotifier (0 widget rebuilds!)
+    _touchPointNotifier.value = event.localPosition;
 
     if (_activePointers.length == 1) {
-      final dx = event.delta.dx * _cursorSensitivity;
-      final dy = event.delta.dy * _cursorSensitivity;
-      if (_laserModeActive) {
-        widget.socketService.sendLaser(active: true, dx: dx, dy: dy);
-      } else if (_spotlightModeActive) {
-        widget.socketService.sendSpotlight(active: true, dx: dx, dy: dy);
-      } else {
-        widget.socketService.sendMove(dx, dy);
-      }
+      // Smooth velocity-based pointer acceleration curve
+      final accel = math.min(2.8, 1.45 + stepDist * 0.045);
+      _pendingDx += event.delta.dx * accel;
+      _pendingDy += event.delta.dy * accel;
+      _scheduleNetworkFlush();
     } else if (_activePointers.length >= 2) {
-      if (!_presenterLocked && event.delta.dy.abs() > 0.4) {
-        final scrollDy = -event.delta.dy * _scrollSensitivity;
-        widget.socketService.sendScroll(scrollDy);
+      if (!_presenterLocked && event.delta.dy.abs() > 0.3) {
+        _pendingScrollDy += -event.delta.dy * _scrollSensitivity;
+        _scheduleNetworkFlush();
       }
     }
   }
@@ -357,9 +387,7 @@ class _ControllerScreenState extends State<ControllerScreen>
         }
       }
 
-      setState(() {
-        _activeTouchPosition = null;
-      });
+      _touchPointNotifier.value = null;
       _maxPointersInGesture = 0;
     }
   }
@@ -590,20 +618,26 @@ class _ControllerScreenState extends State<ControllerScreen>
                       onPointerMove: _onPointerMove,
                       onPointerUp: (e) => _onPointerUpOrCancel(e.pointer),
                       onPointerCancel: (e) => _onPointerUpOrCancel(e.pointer),
-                      child: Container(
-                        decoration: BoxDecoration(
-                          color: ApirBrand.darkMaroonSurface,
-                          borderRadius: BorderRadius.circular(28),
-                          border: Border.all(
-                            color: _laserModeActive
-                                ? ApirBrand.crimsonRed
-                                : ((_spotlightModeActive ||
-                                        _activeTouchPosition != null)
-                                    ? ApirBrand.goldenAmber
-                                    : ApirBrand.warmCream25),
-                            width: 1.5,
-                          ),
-                        ),
+                      child: ValueListenableBuilder<Offset?>(
+                        valueListenable: _touchPointNotifier,
+                        builder: (context, touchPos, trackpadChild) {
+                          return Container(
+                            decoration: BoxDecoration(
+                              color: ApirBrand.darkMaroonSurface,
+                              borderRadius: BorderRadius.circular(28),
+                              border: Border.all(
+                                color: _laserModeActive
+                                    ? ApirBrand.crimsonRed
+                                    : ((_spotlightModeActive ||
+                                            touchPos != null)
+                                        ? ApirBrand.goldenAmber
+                                        : ApirBrand.warmCream25),
+                                width: 1.5,
+                              ),
+                            ),
+                            child: trackpadChild,
+                          );
+                        },
                         child: ClipRRect(
                           borderRadius: BorderRadius.circular(28),
                           child: Stack(
@@ -637,11 +671,13 @@ class _ControllerScreenState extends State<ControllerScreen>
                                   ),
                                 ),
                               ),
-                              CustomPaint(
-                                painter: DotMatrixTrackpadPainter(
-                                  touchPoint: _activeTouchPosition,
-                                  isLaserActive: _laserModeActive,
-                                  isLocked: _presenterLocked,
+                              RepaintBoundary(
+                                child: CustomPaint(
+                                  painter: DotMatrixTrackpadPainter(
+                                    touchPointListenable: _touchPointNotifier,
+                                    isLaserActive: _laserModeActive,
+                                    isLocked: _presenterLocked,
+                                  ),
                                 ),
                               ),
 
@@ -1284,21 +1320,23 @@ class _ControllerScreenState extends State<ControllerScreen>
 /// (`#F59E1D`) around the user's touch point during cursor movement, or glow
 /// CRIMSON RED (`#9E1F36`) when Virtual Laser Pointer mode is active.
 class DotMatrixTrackpadPainter extends CustomPainter {
-  final Offset? touchPoint;
+  final ValueListenable<Offset?> touchPointListenable;
   final bool isLaserActive;
   final bool isLocked;
 
   DotMatrixTrackpadPainter({
-    required this.touchPoint,
+    required this.touchPointListenable,
     required this.isLaserActive,
     required this.isLocked,
-  });
+  }) : super(repaint: touchPointListenable);
 
   @override
   void paint(Canvas canvas, Size size) {
     const double spacing = 24.0;
     const double baseRadius = 1.75;
     const double influenceRadius = 115.0;
+    const double influenceRadiusSq = influenceRadius * influenceRadius;
+    final Offset? touchPoint = touchPointListenable.value;
 
     // Active Laser Mode Glow: Crimson Red (#9E1F36)
     // Primary Accent & Normal Trackpad Glow: Golden Amber (#F59E1D)
@@ -1306,24 +1344,26 @@ class DotMatrixTrackpadPainter extends CustomPainter {
         isLaserActive ? ApirBrand.crimsonRed : ApirBrand.goldenAmber;
 
     // Inactive Trackpad Dots: Warm Cream (#FDECC8 at 25% opacity)
-    final Color baseDotColor = ApirBrand.warmCream25;
+    const Color baseDotColor = ApirBrand.warmCream25;
 
     final Paint basePaint = Paint()
       ..color = baseDotColor
       ..style = PaintingStyle.fill;
+    final Paint activeDotPaint = Paint()..style = PaintingStyle.fill;
+    final Paint glowPaint = Paint()..style = PaintingStyle.fill;
 
     // Ambient radial halo around active touch point
     if (touchPoint != null) {
       final Rect haloRect =
-          Rect.fromCircle(center: touchPoint!, radius: influenceRadius);
+          Rect.fromCircle(center: touchPoint, radius: influenceRadius);
       final Paint haloPaint = Paint()
         ..shader = RadialGradient(
           colors: [
-            activeGlowColor.withOpacity(isLaserActive ? 0.34 : 0.24),
+            activeGlowColor.withOpacity(isLaserActive ? 0.36 : 0.26),
             activeGlowColor.withOpacity(0.0),
           ],
         ).createShader(haloRect);
-      canvas.drawCircle(touchPoint!, influenceRadius, haloPaint);
+      canvas.drawCircle(touchPoint, influenceRadius, haloPaint);
     }
 
     final int cols = (size.width / spacing).floor();
@@ -1342,28 +1382,25 @@ class DotMatrixTrackpadPainter extends CustomPainter {
           continue;
         }
 
-        final double dist = (dotCenter - touchPoint!).distance;
-        if (dist >= influenceRadius) {
+        final double dx = x - touchPoint.dx;
+        final double dy = y - touchPoint.dy;
+        final double distSq = dx * dx + dy * dy;
+        if (distSq >= influenceRadiusSq) {
           canvas.drawCircle(dotCenter, baseRadius, basePaint);
         } else {
+          final double dist = math.sqrt(distSq);
           // Smooth falloff curve (0.0 at edge -> 1.0 at touch center)
           final double t = 1.0 - (dist / influenceRadius);
           final double eased = t * t * (3.0 - 2.0 * t);
           final double radius = baseRadius + 3.4 * eased;
 
-          final Color blendedColor =
-              Color.lerp(baseDotColor, activeGlowColor, eased)!;
-
-          if (eased > 0.45) {
-            final Paint glowPaint = Paint()
-              ..color = activeGlowColor.withOpacity(0.55 * eased)
-              ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 5.5);
-            canvas.drawCircle(dotCenter, radius + 2.2, glowPaint);
+          if (eased > 0.35) {
+            glowPaint.color = activeGlowColor.withOpacity(0.28 * eased);
+            canvas.drawCircle(dotCenter, radius * 1.65, glowPaint);
           }
 
-          final Paint activeDotPaint = Paint()
-            ..color = blendedColor
-            ..style = PaintingStyle.fill;
+          activeDotPaint.color =
+              Color.lerp(baseDotColor, activeGlowColor, eased)!;
           canvas.drawCircle(dotCenter, radius, activeDotPaint);
         }
       }
@@ -1372,7 +1409,7 @@ class DotMatrixTrackpadPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant DotMatrixTrackpadPainter oldDelegate) {
-    return oldDelegate.touchPoint != touchPoint ||
+    return oldDelegate.touchPointListenable != touchPointListenable ||
         oldDelegate.isLaserActive != isLaserActive ||
         oldDelegate.isLocked != isLocked;
   }

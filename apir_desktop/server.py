@@ -109,11 +109,15 @@ _THREAD_LOCAL = threading.local()
 
 def enable_windows_dpi_awareness() -> None:
     """
-    Enable Per-Monitor DPI awareness on Windows so `pynput` cursor coordinates
-    and `tkinter` Laser/Spotlight overlay positions match 1:1 on 125%/150%/200% displays.
+    Enable Per-Monitor DPI awareness and 1ms high-resolution multimedia timers on Windows
+    so cursor movement and Tkinter Laser/Spotlight overlays run at 120Hz+ with 1:1 coordinates.
     """
     if platform.system() != "Windows":
         return
+    try:
+        ctypes.windll.winmm.timeBeginPeriod(1)
+    except Exception:
+        pass
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
     except Exception:
@@ -361,8 +365,10 @@ class ApirOverlayUI:
         self._root: Optional[tk.Tk] = None
         self._qr_window: Optional[tk.Tk] = None
         self._laser_window: Optional[tk.Toplevel] = None
+        self._laser_hwnd: Optional[int] = None
         self._spotlight_window: Optional[tk.Toplevel] = None
         self._spotlight_canvas: Optional[tk.Canvas] = None
+        self._spotlight_item_id: Optional[int] = None
         self._qr_photo: Optional[ImageTk.PhotoImage] = None
         self._logo_photo: Optional[ImageTk.PhotoImage] = None
         self._icon_photo: Optional[ImageTk.PhotoImage] = None
@@ -724,6 +730,11 @@ class ApirOverlayUI:
         )
 
         self._apply_click_through(win, transparent_key)
+        if platform.system() == "Windows":
+            try:
+                self._laser_hwnd = ctypes.windll.user32.GetParent(win.winfo_id()) or win.winfo_id()
+            except Exception:
+                self._laser_hwnd = None
         self._laser_window = win
 
     def _create_spotlight_overlay(self) -> None:
@@ -750,6 +761,15 @@ class ApirOverlayUI:
         )
         canvas.pack(fill=tk.BOTH, expand=True)
 
+        r = self._spotlight_radius
+        self._spotlight_item_id = canvas.create_oval(
+            -r * 2, -r * 2, -r, -r,
+            fill="#010203",
+            outline=BRAND_GOLDEN_AMBER,
+            width=3,
+            tags="spot",
+        )
+
         self._apply_click_through(win, transparent_key, alpha=0.68)
         self._spotlight_window = win
         self._spotlight_canvas = canvas
@@ -757,6 +777,8 @@ class ApirOverlayUI:
     def _poll_queue(self) -> None:
         if self._root is None:
             return
+        latest_laser: Optional[Dict[str, Any]] = None
+        latest_spotlight: Optional[Dict[str, Any]] = None
         try:
             while True:
                 cmd = self.cmd_queue.get_nowait()
@@ -776,16 +798,10 @@ class ApirOverlayUI:
                         self._qr_window.focus_force()
 
                 elif action == "laser":
-                    active = bool(cmd.get("active", False))
-                    x = int(cmd.get("x", 0))
-                    y = int(cmd.get("y", 0))
-                    self._update_laser_window(active, x, y)
+                    latest_laser = cmd
 
                 elif action == "spotlight":
-                    active = bool(cmd.get("active", False))
-                    x = int(cmd.get("x", 0))
-                    y = int(cmd.get("y", 0))
-                    self._update_spotlight_window(active, x, y)
+                    latest_spotlight = cmd
 
                 elif action == "stop":
                     self._root.quit()
@@ -793,7 +809,21 @@ class ApirOverlayUI:
         except queue.Empty:
             pass
 
-        self._root.after(12, self._poll_queue)
+        if latest_laser is not None:
+            self._update_laser_window(
+                bool(latest_laser.get("active", False)),
+                int(latest_laser.get("x", 0)),
+                int(latest_laser.get("y", 0)),
+            )
+
+        if latest_spotlight is not None:
+            self._update_spotlight_window(
+                bool(latest_spotlight.get("active", False)),
+                int(latest_spotlight.get("x", 0)),
+                int(latest_spotlight.get("y", 0)),
+            )
+
+        self._root.after(4, self._poll_queue)
 
     def _update_laser_window(self, active: bool, x: int, y: int) -> None:
         if self._laser_window is None:
@@ -801,11 +831,28 @@ class ApirOverlayUI:
         size = self._laser_radius * 2 + 8
         offset = size // 2
         if active:
-            self._laser_window.geometry(f"{size}x{size}+{x - offset}+{y - offset}")
+            target_x = x - offset
+            target_y = y - offset
             if not self._laser_active:
+                self._laser_window.geometry(f"{size}x{size}+{target_x}+{target_y}")
                 self._laser_window.deiconify()
                 self._laser_window.lift()
+                if platform.system() == "Windows" and not self._laser_hwnd:
+                    try:
+                        self._laser_hwnd = (
+                            ctypes.windll.user32.GetParent(self._laser_window.winfo_id())
+                            or self._laser_window.winfo_id()
+                        )
+                    except Exception:
+                        pass
                 self._laser_active = True
+            elif platform.system() == "Windows" and self._laser_hwnd:
+                # Fast-path Win32 SetWindowPos (SWP_NOSIZE=0x0001 | SWP_NOZORDER=0x0004 | SWP_NOACTIVATE=0x0010)
+                ctypes.windll.user32.SetWindowPos(
+                    self._laser_hwnd, 0, target_x, target_y, 0, 0, 0x0015
+                )
+            else:
+                self._laser_window.geometry(f"{size}x{size}+{target_x}+{target_y}")
         else:
             if self._laser_active:
                 self._laser_window.withdraw()
@@ -816,14 +863,10 @@ class ApirOverlayUI:
             return
         if active:
             r = self._spotlight_radius
-            self._spotlight_canvas.delete("spot")
-            self._spotlight_canvas.create_oval(
-                x - r, y - r, x + r, y + r,
-                fill="#010203",
-                outline=BRAND_GOLDEN_AMBER,
-                width=3,
-                tags="spot",
-            )
+            if self._spotlight_item_id is not None:
+                self._spotlight_canvas.coords(
+                    self._spotlight_item_id, x - r, y - r, x + r, y + r
+                )
             if not self._spotlight_active:
                 self._spotlight_window.deiconify()
                 self._spotlight_window.lift()
@@ -834,9 +877,14 @@ class ApirOverlayUI:
                 self._spotlight_active = False
 
 
+class _WinPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
 class OSInputExecutor:
     """
-    Executes low-latency mouse, keyboard, media, laser, spotlight, and DND operations.
+    Executes ultra-low-latency mouse, keyboard, media, laser, spotlight, and DND operations.
+    Preserves sub-pixel movement remainders so micro-movements never stutter or drop.
     """
 
     def __init__(self, ui: ApirOverlayUI) -> None:
@@ -847,27 +895,48 @@ class OSInputExecutor:
         self.spotlight_active: bool = False
         self.dnd_active: bool = False
         self._fallback_pos = [960, 540]
+        self._rem_x: float = 0.0
+        self._rem_y: float = 0.0
+        self._win_pt = _WinPoint()
+        self._is_windows = platform.system() == "Windows"
 
     def _get_cursor_pos(self) -> tuple[int, int]:
+        if self._is_windows:
+            try:
+                if ctypes.windll.user32.GetCursorPos(ctypes.byref(self._win_pt)):
+                    self._fallback_pos[0] = int(self._win_pt.x)
+                    self._fallback_pos[1] = int(self._win_pt.y)
+                    return int(self._win_pt.x), int(self._win_pt.y)
+            except Exception:
+                pass
         pos = self.mouse.position
         if pos is not None and len(pos) == 2 and pos[0] is not None and pos[1] is not None:
             self._fallback_pos = [int(pos[0]), int(pos[1])]
             return int(pos[0]), int(pos[1])
         return self._fallback_pos[0], self._fallback_pos[1]
 
-    def _move_cursor_relative(self, ix: int, iy: int) -> None:
+    def _move_cursor_subpixel(self, dx: float, dy: float) -> None:
+        total_x = dx + self._rem_x
+        total_y = dy + self._rem_y
+        ix = int(round(total_x))
+        iy = int(round(total_y))
+        self._rem_x = total_x - ix
+        self._rem_y = total_y - iy
+
         if ix == 0 and iy == 0:
             return
         self._fallback_pos[0] += ix
         self._fallback_pos[1] += iy
+        if self._is_windows:
+            try:
+                ctypes.windll.user32.mouse_event(0x0001, ix, iy, 0, 0)
+                return
+            except Exception:
+                pass
         try:
             self.mouse.move(ix, iy)
         except TypeError:
-            if platform.system() == "Windows":
-                try:
-                    ctypes.windll.user32.mouse_event(0x0001, ix, iy, 0, 0)
-                except Exception:
-                    pass
+            pass
 
     def handle_slide(self, direction: str) -> None:
         if direction == "next":
@@ -894,8 +963,7 @@ class OSInputExecutor:
             logger.info("Presentation -> EXIT (Esc)")
 
     def handle_move(self, dx: float, dy: float) -> None:
-        ix, iy = int(round(dx)), int(round(dy))
-        self._move_cursor_relative(ix, iy)
+        self._move_cursor_subpixel(dx, dy)
         if self.laser_active:
             cx, cy = self._get_cursor_pos()
             self.ui.set_laser(True, cx, cy)
@@ -962,8 +1030,7 @@ class OSInputExecutor:
         if active and self.spotlight_active:
             self.spotlight_active = False
             self.ui.set_spotlight(False, 0, 0)
-        ix, iy = int(round(dx)), int(round(dy))
-        self._move_cursor_relative(ix, iy)
+        self._move_cursor_subpixel(dx, dy)
         cx, cy = self._get_cursor_pos()
         self.ui.set_laser(active, cx, cy)
 
@@ -972,8 +1039,7 @@ class OSInputExecutor:
         if active and self.laser_active:
             self.laser_active = False
             self.ui.set_laser(False, 0, 0)
-        ix, iy = int(round(dx)), int(round(dy))
-        self._move_cursor_relative(ix, iy)
+        self._move_cursor_subpixel(dx, dy)
         cx, cy = self._get_cursor_pos()
         self.ui.set_spotlight(active, cx, cy)
 
@@ -1074,6 +1140,15 @@ class ApirServer:
 
     async def handler(self, websocket: ServerConnection) -> None:
         peer = websocket.remote_address
+        # Disable Nagle's algorithm (TCP_NODELAY) for zero-latency cursor & laser streaming
+        try:
+            transport = getattr(websocket, "transport", None)
+            if transport is not None:
+                sock = transport.get_extra_info("socket")
+                if sock is not None:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
         logger.info("Incoming WebSocket connection from %s", peer)
         is_authenticated = False
 
@@ -1234,6 +1309,7 @@ async def _async_websocket_daemon(
         "0.0.0.0",
         port,
         process_request=apir_server.process_request,
+        compression=None,
     ):
         logger.info("Apir Server listening on http://%s:%d & %s", local_ip, port, uri)
         try:
